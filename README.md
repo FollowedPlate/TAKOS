@@ -6,4 +6,5 @@ Based on SpiRobs: Logarithmic Spiral-shaped Robots for Versatile Grasping Across
 Setup a .venv for python and install the following dependencies\
 [pip install mujoco](https://github.com/google-deepmind/mujoco/blob/main/python/README.md)\
 pip install mediapy\
-pip install matplotlib
+pip install matplotlib\
+pip install cadquery

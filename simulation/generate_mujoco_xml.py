@@ -4,6 +4,10 @@ import math
 import os
 import datetime
 from pathlib import Path
+from typing import List, Tuple
+
+
+Point2D = Tuple[float, float]
 
 """
 generates a mujoco xml, based on the design-tool from Open-Spiral-Robots
@@ -253,6 +257,180 @@ def generate_mujoco_xml(
     lines.append('</mujoco>')
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+class Params:
+    a: float = 4.95
+    b: float = 0.1764
+    dtheta_deg: int = 30
+    theta_max_pi: float = 6.0
+    p: float = 0.5
+    elastic_percent: float = 5.0
+    elastic_enabled: bool = True
+    extrusion: float = 1.0
+    cone_angle1: float = 5.0
+    cone_angle2: float = 15.0
+    tip_hole_pos: float = 50.0
+    tip_hole_size: float = 1.4
+    base_hole_pos: float = 90.0
+    base_hole_size: float = 3.0
+    sim_stiffness: float = 0.5
+    sim_damping: float = 0.2
+    two_cable: bool = True
+    cable3_cut_enabled: bool = True
+    cable3_cut_pos: float = 25.0
+    cable3_cut_size: float = 14.0
+    _polys_primary: List[List[Point2D]] = []
+    _polys_mirror: List[List[Point2D]] = []
+    _robot_length = 0.0
+
+    def _build_frustum_solid(self):
+        if self._robot_length <= 1e-6:
+            return None
+        try:
+            import cadquery as cq
+        except Exception:
+            return None
+        tip_pos = (float(self.tip_hole_pos_spin.value()) / 100.0) if hasattr(self,
+                                                                             "tip_hole_pos_spin") else self.params.tip_hole_pos
+        tip_size = float(self.tip_hole_size_spin.value()) if hasattr(self,
+                                                                     "tip_hole_size_spin") else self.params.tip_hole_size
+        base_pos = (float(self.base_hole_pos_spin.value()) / 100.0) if hasattr(self,
+                                                                               "base_hole_pos_spin") else self.params.base_hole_pos
+        base_size = float(self.base_hole_size_spin.value()) if hasattr(self,
+                                                                       "base_hole_size_spin") else self.params.base_hole_size
+        y0 = max(0.0, min(1.0, tip_pos)) * (self._tip_size * 0.5)
+        y1 = max(0.0, min(1.0, base_pos)) * (self._base_size * 0.5)
+        p0 = (0.0, y0, 0.0)
+        p1 = (self._robot_length, y1, 0.0)
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        dz = p1[2] - p0[2]
+        length_axis = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length_axis <= 1e-6:
+            return None
+
+        # Build frustum around +X axis in XY plane, then revolve around X
+        profile = [(0.0, 0.0), (length_axis, 0.0), (length_axis, base_size * 0.5), (0.0, tip_size * 0.5)]
+        frustum = (
+            cq.Workplane("XY")
+            .polyline(profile)
+            .close()
+            .revolve(360, (0, 0, 0), (1, 0, 0))
+        )
+
+        # Rotate frustum so its axis aligns with p0->p1, then translate so (length_axis,0,0) maps to p1
+        vx, vy, vz = dx / length_axis, dy / length_axis, dz / length_axis
+        ax, ay, az = 0.0, 0.0, 0.0
+        dot = max(-1.0, min(1.0, vx))
+        angle = math.degrees(math.acos(dot))
+        if abs(angle) > 1e-6:
+            # axis = cross([1,0,0], v) = (0, -vz, vy)
+            ax, ay, az = 0.0, -vz, vy
+            norm = math.sqrt(ax * ax + ay * ay + az * az)
+            if norm > 1e-9:
+                ax, ay, az = ax / norm, ay / norm, az / norm
+                frustum = frustum.rotate((0, 0, 0), (ax, ay, az), angle)
+
+        # compute rotated endpoint for (length_axis,0,0)
+        def rot_vec(vx0, vy0, vz0):
+            if abs(angle) <= 1e-6 or (ax == 0.0 and ay == 0.0 and az == 0.0):
+                return (vx0, vy0, vz0)
+            theta = math.radians(angle)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            kx, ky, kz = ax, ay, az
+            dotp = kx * vx0 + ky * vy0 + kz * vz0
+            rx = vx0 * cos_t + (ky * vz0 - kz * vy0) * sin_t + kx * dotp * (1.0 - cos_t)
+            ry = vy0 * cos_t + (kz * vx0 - kx * vz0) * sin_t + ky * dotp * (1.0 - cos_t)
+            rz = vz0 * cos_t + (kx * vy0 - ky * vx0) * sin_t + kz * dotp * (1.0 - cos_t)
+            return (rx, ry, rz)
+
+        end_rot = rot_vec(length_axis, 0.0, 0.0)
+        tx = p1[0] - end_rot[0]
+        ty = p1[1] - end_rot[1]
+        tz = p1[2] - end_rot[2]
+        frustum = frustum.translate((tx, ty, tz))
+        return frustum
+
+    def _build_cable3_extrude_cut_solid(self):
+        if self.params.two_cable or (not self.params.cable3_cut_enabled) or self._robot_length <= 1e-6:
+            return None
+        try:
+            import cadquery as cq
+        except Exception:
+            return None
+
+        # a1 is Cut Position(%) ratio: controls extrude-cut location.
+        a1 = max(0.0, min(0.50, float(self.cable3_cut_pos_spin.value()) / 100.0))
+        p0 = (0.0, -(1.0 - a1) * self._tip_size * 0.5)
+        p1 = (self._robot_length, -(1.0 - a1) * self._base_size * 0.5)
+        p2 = (self._robot_length, -self._base_size)
+        p3 = (0.0, -self._tip_size)
+
+        cut_depth = max(0.1, 2.0 * self._base_size)
+        base_cut = cq.Workplane("XY").polyline([p0, p1, p2, p3]).close().extrude(cut_depth, both=True)
+
+        cuts = None
+        for ang in (0.0, 120.0, 240.0):
+            inst = base_cut if ang == 0.0 else base_cut.rotate((0, 0, 0), (1, 0, 0), ang)
+            cuts = inst if cuts is None else cuts.union(inst)
+        return cuts
+
+    def _build_cable3_cone_cut_solid(self):
+        if self.params.two_cable or (not self.params.cable3_cut_enabled) or self._robot_length <= 1e-6:
+            return None
+        try:
+            import cadquery as cq
+        except Exception:
+            return None
+
+        # a2 is Cut Size(%) ratio: controls cone-cut size.
+        a2 = max(0.0, min(0.20, float(self.cable3_cut_size_spin.value()) / 100.0))
+        # Placement follows the same centerline from a1 (Cut Position).
+        a1 = max(0.0, min(0.50, float(self.cable3_cut_pos_spin.value()) / 100.0))
+
+        # Build pp1/pp2, then extend their line toward negative x to hit y=0 at pp0.
+        pp1 = (0.0, a2 * self._tip_size)
+        pp2 = (self._robot_length, a2 * self._base_size)
+        pp3 = (self._robot_length, 0.0)
+        dy = pp2[1] - pp1[1]
+        if abs(dy) <= 1e-9:
+            pp0_x = -self._robot_length
+        else:
+            pp0_x = -pp1[1] * self._robot_length / dy
+        pp0 = (pp0_x, 0.0)
+
+        # Revolved cutter now uses a triangle profile: pp0-pp2-pp3.
+        base_cone = (
+            cq.Workplane("XY")
+            .polyline([pp0, pp2, pp3])
+            .close()
+            .revolve(360.0, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        )
+
+        p0 = (0.0, -(1.0 - a1) * self._tip_size * 0.5, 0.0)
+        p1 = (self._robot_length, -(1.0 - a1) * self._base_size * 0.5, 0.0)
+        theta_deg = math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
+
+        aligned = base_cone.rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), theta_deg)
+        x3_rot = self._robot_length * math.cos(math.radians(theta_deg))
+        y3_rot = self._robot_length * math.sin(math.radians(theta_deg))
+        aligned = aligned.translate((p1[0] - x3_rot, p1[1] - y3_rot, p1[2]))
+
+        cuts = None
+        for ang in (0.0, 120.0, 240.0):
+            inst = aligned if ang == 0.0 else aligned.rotate((0, 0, 0), (1, 0, 0), ang)
+            cuts = inst if cuts is None else cuts.union(inst)
+        return cuts
+
+    def _build_cable3_cut_solid(self):
+        extrude_cuts = self._build_cable3_extrude_cut_solid()
+        cone_cuts = self._build_cable3_cone_cut_solid()
+        if extrude_cuts is None:
+            return cone_cuts
+        if cone_cuts is None:
+            return extrude_cuts
+        return extrude_cuts.union(cone_cuts)
+
 
 def export_xml(self) -> None:
         print("exporting xml")
@@ -265,11 +443,11 @@ def export_xml(self) -> None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         xml_dir = os.path.join(out_dir, f"xml_{ts}")
         os.makedirs(xml_dir, exist_ok=True)
+        self._robot_length = max(x for x, _y in self.primary[-1])
 
         # Build only the rightmost unit without elastic layer
-        if not self._polys_primary:
-            return
-        if self.params.two_cable:
+
+        if self.two_cable:
             thickness = max(0.1, float(self.extrusion_spin.value()))
             solid = None
             right_primary = self._polys_primary[-1]
@@ -281,7 +459,6 @@ def export_xml(self) -> None:
                 solid = wp if solid is None else solid.union(wp)
             if solid is None:
                 return
-
         else:
             solid = None
             right_primary = self._polys_primary[-1]
@@ -333,8 +510,8 @@ def export_xml(self) -> None:
         if self._polys_primary:
             last_poly = self._polys_primary[-1]
             if len(last_poly) >= 4:
-                p0_line = (0.0, self.params.tip_hole_pos * self._tip_size * 0.5)
-                p1_line = (self._robot_length, self.params.base_hole_pos * self._base_size * 0.5)
+                p0_line = (0.0, self.tip_hole_pos * self._tip_size * 0.5)
+                p1_line = (self._robot_length, self.base_hole_pos * self._base_size * 0.5)
                 dx = p1_line[0] - p0_line[0]
                 dy = p1_line[1] - p0_line[1]
                 if abs(dx) < 1e-9 and abs(dy) < 1e-9:
@@ -366,9 +543,9 @@ def export_xml(self) -> None:
                         y1 = p0_line[1] + slope * (x1 - p0_line[0])
                         y2 = p0_line[1] + slope * (x2 - p0_line[0])
                     site_points = (x1, y1, x2, y2)
-        gamma = math.exp(self.params.b * math.radians(self.params.dtheta_deg))
+        gamma = math.exp(self.b * math.radians(self.dtheta_deg))
         num_units = max(1, len(self._polys_primary))
-        joint_type = "hinge" if self.params.two_cable else "ball"
+        joint_type = "hinge" if self.two_cable else "ball"
         try:
             generate_mujoco_xml(
                 xml_path,
@@ -377,11 +554,17 @@ def export_xml(self) -> None:
                 scale=gamma,
                 num_units=num_units,
                 joint_type=joint_type,
-                joint_limit_deg=self.params.dtheta_deg,
+                joint_limit_deg=self.dtheta_deg,
                 robot_length=self._robot_length,
                 site_points=site_points,
-                cable_mode=3 if not self.params.two_cable else 2,
+                cable_mode=3 if not self.two_cable else 2,
             )
         except Exception as exc:
             print(f"[Export XML] failed: {exc}")
             return
+
+
+
+if __name__ == "__main__":
+    temp = Params
+    export_xml(temp)
