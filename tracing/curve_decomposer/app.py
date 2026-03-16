@@ -113,7 +113,8 @@ class CurveDrawer:
 
     def _on_release(self, event):
         self._drawing = False
-        self._do_decompose()
+        if len(self._points) >= 2:
+            self._do_decompose()
 
     # ------------------------------------------------------------------
     # Actions

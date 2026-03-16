@@ -104,9 +104,67 @@ def decompose_curve(
     lengths = [length * total / sum_len for length in lengths]
     segments = []
 
-    # add logic
-    # should follow the drawn lines, but each segment should have the length in lengths
-    # and each segment should be at most max_angle away from parallel
+    # Cumulative arc-length targets on the original curve.
+    # target_dists[i] is where the end of segment i *should* land if there
+    # were no angle constraint.  Even when we drift off-curve we keep using
+    # these as "aim points" so we always know where to head back to.
+    cumulative = 0.0
+    target_dists = []
+    for l in lengths:
+        cumulative += l
+        target_dists.append(min(cumulative, total))
+
+    start_pt: Point = points[0]
+    prev_dx: Optional[float] = None   # unit direction of the last segment
+    prev_dy: Optional[float] = None
+
+    for i in range(n):
+        seg_len = lengths[i]
+
+        # ── Step 1: desired direction ──────────────────────────────────────
+        # Aim from current start_pt toward the expected arc-length position on
+        # the original curve.
+        aim_pt = _point_at_distance(points, target_dists[i])
+        dx = aim_pt[0] - start_pt[0]
+        dy = aim_pt[1] - start_pt[1]
+        mag = math.hypot(dx, dy)
+
+        if mag < 1e-12:
+            # start_pt is already on top of the aim point; keep previous
+            # direction or fall back to the local curve tangent.
+            if prev_dx is not None:
+                dx, dy = prev_dx, prev_dy
+            else:
+                look_ahead = _point_at_distance(points, min(target_dists[i] + 1.0, total))
+                look_back  = _point_at_distance(points, max(target_dists[i] - 1.0, 0.0))
+                dx = look_ahead[0] - look_back[0]
+                dy = look_ahead[1] - look_back[1]
+                mag = math.hypot(dx, dy)
+                dx, dy = (dx / mag, dy / mag) if mag > 1e-12 else (1.0, 0.0)
+        else:
+            dx, dy = dx / mag, dy / mag
+
+        # ── Step 2: clamp direction to max_angle cone ──────────────────────
+        if max_angle is not None and prev_dx is not None:
+            cos_a = max(-1.0, min(1.0, prev_dx * dx + prev_dy * dy))
+            turn  = math.acos(cos_a)
+
+            if turn > max_angle + 1e-9:
+                # Rotate prev_direction by ±max_angle toward the desired
+                # direction. The sign of the cross product tells us which way.
+                cross = prev_dx * dy - prev_dy * dx   # z of (prev × desired)
+                angle = math.copysign(max_angle, cross)
+                cos_r, sin_r = math.cos(angle), math.sin(angle)
+                dx = cos_r * prev_dx - sin_r * prev_dy
+                dy = sin_r * prev_dx + cos_r * prev_dy
+
+        # ── Step 3: emit segment of exact length in clamped direction ──────
+        end_pt: Point = (start_pt[0] + dx * seg_len,
+                         start_pt[1] + dy * seg_len)
+        segments.append((start_pt, end_pt))
+
+        prev_dx, prev_dy = dx, dy
+        start_pt = end_pt
 
     return segments
 
